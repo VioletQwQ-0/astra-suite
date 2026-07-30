@@ -480,12 +480,20 @@ fn create_interrupt_result_claude_stream_script() -> tempfile::TempDir {
         }},
         "total_cost_usd": 0.05
     });
+    let control_response = serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": "astra_interrupt_1"
+        }
+    });
     let content = format!(
         "#!/bin/sh\n\
          case \"$*\" in *--version*) echo '2.1.0'; exit 0;; esac\n\
          while IFS= read -r line; do\n\
-           case \"$line\" in *'\"subtype\":\"interrupt\"'*) printf '%s\\n' '{}'; exit 0;; esac\n\
+           case \"$line\" in *'\"subtype\":\"interrupt\"'*) printf '%s\\n' '{}'; printf '%s\\n' '{}'; exit 0;; esac\n\
          done\n",
+        control_response.to_string().replace('\'', "'\\''"),
         result.to_string().replace('\'', "'\\''")
     );
     std::fs::write(&path, content).unwrap();
@@ -1404,11 +1412,7 @@ async fn persistent_claude_cancel_preserves_partial_usage_and_session() {
     .await
     .expect("turn should become active");
 
-    adapter_tx
-        .send(msg("chat-cancel-partial", "user-1", "/esc"))
-        .await
-        .unwrap();
-    let cancel_response = tokio::time::timeout(Duration::from_secs(3), async {
+    let cancel_response = tokio::time::timeout(Duration::from_secs(6), async {
         loop {
             if let Some((_, text)) = outputs
                 .lock()
@@ -1419,7 +1423,14 @@ async fn persistent_claude_cancel_preserves_partial_usage_and_session() {
             {
                 break text;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            // A Running trace can briefly precede registration of its live
+            // cancellation token. `/esc` explicitly asks callers to retry in
+            // that window, so exercise the same contract here.
+            adapter_tx
+                .send(msg("chat-cancel-partial", "user-1", "/esc"))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await

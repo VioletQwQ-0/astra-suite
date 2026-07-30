@@ -3,6 +3,7 @@
 use crate::access_control::{ActionCapability, ActionSource};
 use crate::cli_bridge::{REASONING_PREF_KEY, ReasoningDisplay};
 use crate::codex_app_pool::CodexAppPool;
+use crate::codex_sessions::{self, CodexSessionPage};
 use crate::config::GatewayConfig;
 use crate::store::{self, GatewayStore};
 use crate::trace_model::{
@@ -90,6 +91,83 @@ fn normalize_session_selector(selector: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+fn compact_session_text(value: &str, limit: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let shortened = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
+}
+
+fn format_codex_session_time(timestamp_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "时间未知".into())
+}
+
+fn format_codex_session_page(page: &CodexSessionPage, current: Option<&str>) -> String {
+    if page.total == 0 {
+        return "📋 Codex 没有本地历史会话。".into();
+    }
+
+    let mut blocks = vec![format!(
+        "📋 **Codex 本地会话** · 第 {}/{} 页 · 共 {} 个",
+        page.page, page.total_pages, page.total
+    )];
+    for (index, session) in page.items.iter().enumerate() {
+        let marker = if current == Some(session.id.as_str()) {
+            "→"
+        } else {
+            " "
+        };
+        let short = crate::runner::truncate_chars(&session.id, 12);
+        let archive = if session.archived { " [归档]" } else { "" };
+        let number = (page.page - 1) * codex_sessions::PAGE_SIZE + index as u32 + 1;
+        let display_text = session
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                (!session.last_user_message.trim().is_empty())
+                    .then_some(session.last_user_message.as_str())
+            })
+            .map(|text| format!(" {}", compact_session_text(text, 64)))
+            .unwrap_or_default();
+        let mut entry = vec![format!(
+            "{marker} **{number}.** `{short}`{display_text}{archive}"
+        )];
+
+        let mut details = Vec::new();
+        details.push(format_codex_session_time(session.updated_at_ms));
+        if !session.cwd.is_empty() {
+            details.push(format!("`{}`", compact_session_text(&session.cwd, 36)));
+        }
+        if let Some(branch) = session.git_branch.as_deref() {
+            details.push(format!("`{}`", compact_session_text(branch, 18)));
+        }
+        entry.push(details.join(" · "));
+        blocks.push(entry.join("  \n"));
+    }
+
+    let mut hints = vec!["`/session switch <前12位>` 切换".to_string()];
+    if page.page < page.total_pages {
+        hints.push(format!("`/session list {}` 下一页", page.page + 1));
+    }
+    if page.page > 1 {
+        hints.push(format!("`/session list {}` 上一页", page.page - 1));
+    }
+    blocks.push(hints.join(" · "));
+    blocks.join("\n\n")
 }
 
 pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<String> {
@@ -322,7 +400,35 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 return Some(lines.join("\n"));
             }
 
-            if arg == "list" {
+            if arg == "list" || arg.starts_with("list ") {
+                let requested_page = match arg.strip_prefix("list").unwrap_or("").trim() {
+                    "" => 1,
+                    value => match value.parse::<u32>() {
+                        Ok(page) if page > 0 => page,
+                        _ => return Some("用法: `/session list [页码]`".into()),
+                    },
+                };
+
+                if matches!(
+                    ctx.resolved_cli,
+                    crate::cli_bridge::CliProfile::Codex { .. }
+                ) {
+                    match codex_sessions::list_sessions(requested_page).await {
+                        Ok(page) => {
+                            let current = require_store!(ctx)
+                                .get_current_session(ctx.platform, ctx.chat_id, cli_name)
+                                .await
+                                .ok()
+                                .flatten();
+                            return Some(format_codex_session_page(&page, current.as_deref()));
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to read local Codex session catalog");
+                            return Some(format!("⚠️ 无法读取 Codex 本地会话: {error}"));
+                        }
+                    }
+                }
+
                 let sessions = require_store!(ctx)
                     .list_sessions(ctx.platform, ctx.chat_id, cli_name)
                     .await
@@ -378,6 +484,37 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     Err(e) => return Some(format!("⚠️ 切换失败: {e}")),
                 };
                 match matches.as_slice() {
+                    [] if matches!(
+                        ctx.resolved_cli,
+                        crate::cli_bridge::CliProfile::Codex { .. }
+                    ) =>
+                    {
+                        match codex_sessions::find_sessions_by_prefix(&target).await {
+                            Ok(found) => match found.as_slice() {
+                                [] => Some(format!("❌ 找不到会话 `{target}`")),
+                                [session_id] => match store
+                                    .set_current_session(
+                                        ctx.platform,
+                                        ctx.chat_id,
+                                        ctx.user_id,
+                                        session_id,
+                                        cli_name,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => Some(format!(
+                                        "✅ 已切换到会话 `{}`",
+                                        &session_id[..8.min(session_id.len())]
+                                    )),
+                                    Err(e) => Some(format!("⚠️ 切换失败: {e}")),
+                                },
+                                _ => Some(format!(
+                                    "⚠️ 会话前缀 `{target}` 匹配到多个会话，请补充更多字符。"
+                                )),
+                            },
+                            Err(error) => Some(format!("⚠️ 无法读取 Codex 本地会话: {error}")),
+                        }
+                    }
                     [] => Some(format!("❌ 找不到会话 `{target}`")),
                     [session_id] => match store
                         .switch_session(ctx.platform, ctx.chat_id, cli_name, session_id)
@@ -395,7 +532,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                     )),
                 }
             } else {
-                Some("用法: `/session [list|switch <id>|current]`".into())
+                Some("用法: `/session [list [页码]|switch <id>|current]`".into())
             }
         }
 
@@ -899,7 +1036,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
              **对话**\n\
              `/new` (`/reset`) — 停用当前会话并新建（历史仍可恢复）\n\
              `/compact [说明]` — 压缩上下文，原始历史仍保留（仅 Claude profile）\n\
-             `/session list` — 历史会话\n\
+             `/session list [页码]` — 历史会话\n\
              `/session switch <id>` — 切换会话\n\n\
              **模型**\n\
              `/model` — 当前模型 + 快捷列表\n\
@@ -1122,6 +1259,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         repo,
                         &conversation,
                         ctx.active_requests,
+                        ctx.gateway_start,
                         "cancelled by user via /cancel all",
                     )
                     .await,
@@ -1199,6 +1337,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                         repo,
                         &conversation,
                         ctx.active_requests,
+                        ctx.gateway_start,
                         if command_name == "/kill" {
                             "interrupted by user via /esc all (/kill alias)"
                         } else {
@@ -1229,6 +1368,37 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
                 }
                 return Some(format!("❌ 找不到匹配 `{arg}` 的请求"));
             };
+            if row.status == RequestStatus::Accepted {
+                return match repo
+                    .cancel_accepted_request(
+                        &conversation,
+                        row.trace_id.as_str(),
+                        if command_name == "/kill" {
+                            "cancelled by user via /esc (/kill alias)"
+                        } else {
+                            "cancelled by user via /esc"
+                        },
+                    )
+                    .await
+                {
+                    Ok(CancelRequestOutcome::Cancelled(r)) => {
+                        Some(format!("🚫 已取消: {}", truncate_text(&r.text_preview, 40)))
+                    }
+                    Ok(CancelRequestOutcome::AlreadyRunning(_)) => {
+                        Some("⚠️ 请求已开始投递或运行，请稍后再用 `/esc`。".into())
+                    }
+                    Ok(CancelRequestOutcome::NotFound) => {
+                        Some("⚠️ 请求状态已变化，未执行中断。".into())
+                    }
+                    Err(e) => Some(format!("⚠️ 中断失败: {e}")),
+                };
+            }
+            let has_live_token = ctx
+                .active_requests
+                .is_some_and(|tasks| tasks.contains_key(row.trace_id.as_str()));
+            if !has_live_token && !is_zombie_request(&row.created_at, ctx.gateway_start) {
+                return Some("⚠️ 请求正在投递，暂时无法撤回；请稍后再用 `/esc`。".into());
+            }
             match repo
                 .force_fail_request(
                     &row.trace_id,
@@ -1570,7 +1740,7 @@ pub async fn handle_command(ctx: &CommandContext<'_>, text: &str) -> Option<Stri
             lines.push("| `/reasoning on\\|off` | Toggle reasoning blocks |".to_string());
             lines.push("| `/ws ls` | List projects |".to_string());
             lines.push("| `/ws <name>` | Switch workspace |".to_string());
-            lines.push("| `/session list` | Session history |".to_string());
+            lines.push("| `/session list [page]` | Session history |".to_string());
             lines.push("| `/cron list` | Scheduled tasks |".to_string());
             lines.push("| `/task list` | Scheduled tasks/reminders |".to_string());
             lines.push("| `/running` | Active requests (numbered) |".to_string());
@@ -1761,6 +1931,7 @@ async fn kill_or_cancel_all(
     repo: &dyn TraceRepository,
     conversation: &ConversationKey,
     active_requests: Option<&dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    gateway_start: chrono::DateTime<chrono::Utc>,
     reason: &str,
 ) -> String {
     let rows = match repo.list_active_requests(conversation, 200).await {
@@ -1774,6 +1945,38 @@ async fn kill_or_cancel_all(
     let mut live_interrupted = 0usize;
     let mut zombie_cleared = 0usize;
     for row in &rows {
+        if row.status == RequestStatus::Accepted {
+            match repo
+                .cancel_accepted_request(conversation, row.trace_id.as_str(), reason)
+                .await
+            {
+                Ok(CancelRequestOutcome::Cancelled(_)) => db_cleared += 1,
+                Ok(CancelRequestOutcome::AlreadyRunning(_)) => {}
+                Ok(CancelRequestOutcome::NotFound) => zombie_cleared += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "gateway::commands",
+                        trace_id = %row.trace_id.as_str(),
+                        error = %e,
+                        "cancel_accepted_request failed during /esc all"
+                    );
+                }
+            }
+            if let Some(tasks) = active_requests
+                && let Some((_, token)) = tasks.remove(row.trace_id.as_str())
+            {
+                token.cancel();
+                live_interrupted += 1;
+            }
+            continue;
+        }
+        let has_live_token =
+            active_requests.is_some_and(|tasks| tasks.contains_key(row.trace_id.as_str()));
+        if !has_live_token && !is_zombie_request(&row.created_at, gateway_start) {
+            // A current-process Running request without a token is in the
+            // atomic steering-dispatch window. It cannot be safely retracted.
+            continue;
+        }
         match repo.force_fail_request(&row.trace_id, reason).await {
             Ok(true) => db_cleared += 1,
             Ok(false) => {
@@ -4430,5 +4633,40 @@ mod tests {
             normalize_session_selector("\u{FEFF}ac73779a\u{200C}\u{200D}"),
             "ac73779a"
         );
+    }
+
+    #[test]
+    fn codex_session_list_uses_mobile_safe_breaks_and_only_custom_titles() {
+        let page = CodexSessionPage {
+            items: vec![crate::codex_sessions::CodexSessionSummary {
+                id: "019f924a-504f-7102-8c82-038fb58a58be".into(),
+                name: Some("hashbuild".into()),
+                title: "first user message used as generated title".into(),
+                last_user_message: "latest question".into(),
+                cwd: "/workspace".into(),
+                model: None,
+                reasoning_effort: None,
+                git_branch: Some("main".into()),
+                source: "cli".into(),
+                thread_source: None,
+                updated_at_ms: 1_700_000_000_000,
+                archived: false,
+            }],
+            page: 1,
+            total: 1,
+            total_pages: 1,
+        };
+
+        let output = format_codex_session_page(&page, None);
+        assert!(output.contains("hashbuild"));
+        assert!(!output.contains("latest question"));
+        assert!(!output.contains("first user message"));
+        assert!(output.contains("\n\n"));
+
+        let mut without_title = page;
+        without_title.items[0].name = None;
+        let output = format_codex_session_page(&without_title, None);
+        assert!(output.contains("latest question"));
+        assert!(!output.contains("first user message"));
     }
 }
